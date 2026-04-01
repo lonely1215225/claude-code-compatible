@@ -2,7 +2,12 @@ import {
   getAPIProvider,
   getProviderValidationMode,
 } from '../../utils/model/providers.js'
-import { getGeminiClient, getGeminiModel } from './geminiClient.js'
+import {
+  getGeminiApiKey,
+  getGeminiBaseUrl,
+  getGeminiModel,
+} from './geminiClient.js'
+import { generateGeminiContentViaPython } from './geminiRest.js'
 import {
   getOpenAIAPIMode,
   getOpenAIClient,
@@ -11,6 +16,16 @@ import {
 
 const OPENAI_VALIDATION_OUTPUT_TOKENS = 16
 const DEFAULT_PROVIDER_VALIDATION_TIMEOUT_MS = getDefaultProviderValidationTimeoutMs()
+
+function shouldFallbackOpenAIResponsesValidation(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
+  return (
+    message.includes("invalid value: 'input_text'") ||
+    (message.includes('input_text') &&
+      message.includes('supported values are') &&
+      message.includes('output_text'))
+  )
+}
 
 export type ProviderValidationResult = {
   provider: ReturnType<typeof getAPIProvider>
@@ -64,25 +79,48 @@ export async function validateConfiguredProvider({
       return { provider, status: 'validated' }
     }
 
-    await withTimeout(
-      client.responses.create({
-        model: getOpenAIModel(),
-        input: 'ping',
-        max_output_tokens: OPENAI_VALIDATION_OUTPUT_TOKENS,
-      }),
-      timeoutMs,
-    )
+    try {
+      await withTimeout(
+        client.responses.create({
+          model: getOpenAIModel(),
+          input: 'ping',
+          max_output_tokens: OPENAI_VALIDATION_OUTPUT_TOKENS,
+        }),
+        timeoutMs,
+      )
+    } catch (error) {
+      if (!shouldFallbackOpenAIResponsesValidation(error)) {
+        throw error
+      }
+      await withTimeout(
+        client.chat.completions.create({
+          model: getOpenAIModel(),
+          messages: [{ role: 'user', content: 'ping' }],
+          max_completion_tokens: OPENAI_VALIDATION_OUTPUT_TOKENS,
+        }),
+        timeoutMs,
+      )
+    }
     return { provider, status: 'validated' }
   }
 
   if (validationMode === 'gemini') {
-    const client = getGeminiClient()
+    const apiKey = getGeminiApiKey()
+    if (!apiKey) {
+      throw new Error(
+        'GEMINI_API_KEY or GOOGLE_API_KEY is required when CLAUDE_CODE_USE_GEMINI=1',
+      )
+    }
     await withTimeout(
-      client.models.generateContent({
+      generateGeminiContentViaPython({
+        apiKey,
+        baseUrl: getGeminiBaseUrl(),
         model: getGeminiModel(),
-        contents: 'ping',
-        config: {
-          maxOutputTokens: 4,
+        body: {
+          contents: [{ parts: [{ text: 'ping' }] }],
+          generationConfig: {
+            maxOutputTokens: 4,
+          },
         },
       }),
       timeoutMs,

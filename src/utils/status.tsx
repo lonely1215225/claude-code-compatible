@@ -11,7 +11,6 @@ import { getDisplayPath } from './file.js';
 import { formatNumber } from './format.js';
 import { getIdeClientName, type IDEExtensionInstallationStatus, isJetBrainsIde, toIDEDisplayName } from './ide.js';
 import { getClaudeAiUserDefaultModelDescription, modelDisplayString } from './model/model.js';
-import { getGeminiUsesVertexAI } from '../services/api/geminiClient.js';
 import {
   getAPIProvider,
   getCurrentProviderLabel,
@@ -342,10 +341,6 @@ export function buildAPIProviderProperties(): Property[] {
         value: geminiBaseUrl
       });
     }
-    properties.push({
-      label: 'Gemini mode',
-      value: getGeminiUsesVertexAI() ? 'Vertex AI / Express' : 'Gemini Developer API'
-    });
     if (process.env.GEMINI_MODEL) {
       properties.push({
         label: 'Gemini model',

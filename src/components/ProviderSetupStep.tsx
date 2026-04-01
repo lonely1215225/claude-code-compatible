@@ -15,7 +15,13 @@ import {
   getCurrentProviderLabel,
   isProviderInteractive,
 } from '../utils/model/providers.js'
-import { isEnvTruthy } from '../utils/envUtils.js'
+import {
+  discoverGeminiModels,
+  discoverOpenAIModels,
+  getSuggestedGeminiModels,
+  getSuggestedOpenAIModels,
+  type DiscoveredProviderModel,
+} from '../services/api/providerModels.js'
 import { validateConfiguredProvider } from '../services/api/providerValidation.js'
 import TextInput from './TextInput.js'
 import { Select } from './CustomSelect/select.js'
@@ -30,16 +36,46 @@ type WizardStep =
   | 'openaiApiKey'
   | 'openaiBaseUrl'
   | 'openaiModel'
+  | 'openaiModelManual'
   | 'openaiMode'
   | 'geminiApiKey'
-  | 'geminiMode'
   | 'geminiBaseUrl'
   | 'geminiModel'
+  | 'geminiModelManual'
   | 'anthropicBaseUrl'
   | 'anthropicModel'
   | 'confirm'
+type ModelDiscoveryState = {
+  status: 'idle' | 'loading' | 'loaded' | 'failed'
+  models: DiscoveredProviderModel[]
+  error: string | null
+  requestKey: string | null
+}
 
-type GeminiTransportMode = 'developer' | 'vertex'
+const MODEL_DISCOVERY_MANUAL_VALUE = '__manual_model__'
+const RUNTIME_PROVIDER_FLAG_KEYS = [
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_OPENAI',
+  'CLAUDE_CODE_USE_GEMINI',
+] as const
+const INITIAL_MODEL_DISCOVERY_STATE: ModelDiscoveryState = {
+  status: 'idle',
+  models: [],
+  error: null,
+  requestKey: null,
+}
+
+function discoveryErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function resetRuntimeProviderFlags(): void {
+  for (const key of RUNTIME_PROVIDER_FLAG_KEYS) {
+    delete process.env[key]
+  }
+}
 
 export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode {
   const initialProvider = useMemo(() => getConfiguredProviderForSetup(), [])
@@ -79,16 +115,17 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
   const [openaiMode, setOpenaiMode] = useState<'responses' | 'chat_completions'>(
     () => getProviderDefaultApiMode('openai'),
   )
-  const [geminiApiKey, setGeminiApiKey] = useState('')
-  const [geminiMode, setGeminiMode] = useState<GeminiTransportMode>(() =>
-    isEnvTruthy(getSavedProviderEnvValue('GOOGLE_GENAI_USE_VERTEXAI'))
-      ? 'vertex'
-      : 'developer',
+  const [openaiModelDiscovery, setOpenaiModelDiscovery] = useState<ModelDiscoveryState>(
+    INITIAL_MODEL_DISCOVERY_STATE,
   )
+  const [geminiApiKey, setGeminiApiKey] = useState('')
   const [geminiBaseUrl, setGeminiBaseUrl] = useState(existingGeminiBaseUrl)
   const [geminiModel, setGeminiModel] = useState(() =>
     getSavedProviderEnvValue('GEMINI_MODEL') ||
     getProviderDefaultModel('gemini'),
+  )
+  const [geminiModelDiscovery, setGeminiModelDiscovery] = useState<ModelDiscoveryState>(
+    INITIAL_MODEL_DISCOVERY_STATE,
   )
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState(
     () => getSavedProviderEnvValue('ANTHROPIC_BASE_URL') || '',
@@ -97,6 +134,26 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     () => getSavedProviderEnvValue('ANTHROPIC_MODEL') || 'sonnet',
   )
   const [cursorOffset, setCursorOffset] = useState(0)
+  const resolvedOpenAIKey = openaiApiKey || existingOpenAIKey || ''
+  const resolvedGeminiKey = geminiApiKey || existingGeminiKey || ''
+  const openaiDiscoveryKey = JSON.stringify([
+    resolvedOpenAIKey,
+    openaiBaseUrl,
+    openaiModel,
+  ])
+  const geminiDiscoveryKey = JSON.stringify([
+    resolvedGeminiKey,
+    geminiBaseUrl,
+    geminiModel,
+  ])
+  const suggestedGeminiModels = useMemo(
+    () => getSuggestedGeminiModels(geminiModel || undefined),
+    [geminiModel],
+  )
+  const suggestedOpenAIModels = useMemo(
+    () => getSuggestedOpenAIModels(openaiModel || undefined),
+    [openaiModel],
+  )
 
   useEffect(() => {
     switch (step) {
@@ -106,7 +163,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       case 'openaiBaseUrl':
         setCursorOffset(openaiBaseUrl.length)
         break
-      case 'openaiModel':
+      case 'openaiModelManual':
         setCursorOffset(openaiModel.length)
         break
       case 'geminiApiKey':
@@ -115,7 +172,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       case 'geminiBaseUrl':
         setCursorOffset(geminiBaseUrl.length)
         break
-      case 'geminiModel':
+      case 'geminiModelManual':
         setCursorOffset(geminiModel.length)
         break
       case 'anthropicBaseUrl':
@@ -138,6 +195,156 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     geminiModel,
     anthropicBaseUrl,
     anthropicModel,
+  ])
+
+  useEffect(() => {
+    if (step !== 'openaiModel') {
+      return
+    }
+    if (!resolvedOpenAIKey) {
+      if (
+        openaiModelDiscovery.requestKey === openaiDiscoveryKey &&
+        openaiModelDiscovery.status === 'failed'
+      ) {
+        return
+      }
+      setOpenaiModelDiscovery({
+        status: 'failed',
+        models: [],
+        error: 'No OpenAI API key available. Enter a model manually.',
+        requestKey: openaiDiscoveryKey,
+      })
+      return
+    }
+    if (
+      openaiModelDiscovery.requestKey === openaiDiscoveryKey &&
+      ['loading', 'loaded'].includes(openaiModelDiscovery.status)
+    ) {
+      return
+    }
+
+    let cancelled = false
+    setOpenaiModelDiscovery({
+      status: 'loading',
+      models: [],
+      error: null,
+      requestKey: openaiDiscoveryKey,
+    })
+
+    void discoverOpenAIModels({
+      apiKey: resolvedOpenAIKey,
+      baseUrl: openaiBaseUrl || undefined,
+      currentModel: openaiModel || undefined,
+    })
+      .then(models => {
+        if (cancelled) {
+          return
+        }
+        setOpenaiModelDiscovery({
+          status: 'loaded',
+          models,
+          error: null,
+          requestKey: openaiDiscoveryKey,
+        })
+      })
+      .catch(error => {
+        if (cancelled) {
+          return
+        }
+        setOpenaiModelDiscovery({
+          status: 'failed',
+          models: [],
+          error: discoveryErrorMessage(error),
+          requestKey: openaiDiscoveryKey,
+        })
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    step,
+    resolvedOpenAIKey,
+    openaiBaseUrl,
+    openaiModel,
+    openaiDiscoveryKey,
+    openaiModelDiscovery.requestKey,
+    openaiModelDiscovery.status,
+  ])
+
+  useEffect(() => {
+    if (step !== 'geminiModel') {
+      return
+    }
+    if (!resolvedGeminiKey) {
+      if (
+        geminiModelDiscovery.requestKey === geminiDiscoveryKey &&
+        geminiModelDiscovery.status === 'failed'
+      ) {
+        return
+      }
+      setGeminiModelDiscovery({
+        status: 'failed',
+        models: [],
+        error: 'No Gemini API key available. Enter a model manually.',
+        requestKey: geminiDiscoveryKey,
+      })
+      return
+    }
+    if (
+      geminiModelDiscovery.requestKey === geminiDiscoveryKey &&
+      ['loading', 'loaded'].includes(geminiModelDiscovery.status)
+    ) {
+      return
+    }
+
+    let cancelled = false
+    setGeminiModelDiscovery({
+      status: 'loading',
+      models: [],
+      error: null,
+      requestKey: geminiDiscoveryKey,
+    })
+
+    void discoverGeminiModels({
+      apiKey: resolvedGeminiKey,
+      baseUrl: geminiBaseUrl || undefined,
+      currentModel: geminiModel || undefined,
+    })
+      .then(models => {
+        if (cancelled) {
+          return
+        }
+        setGeminiModelDiscovery({
+          status: 'loaded',
+          models,
+          error: null,
+          requestKey: geminiDiscoveryKey,
+        })
+      })
+      .catch(error => {
+        if (cancelled) {
+          return
+        }
+        setGeminiModelDiscovery({
+          status: 'failed',
+          models: [],
+          error: discoveryErrorMessage(error),
+          requestKey: geminiDiscoveryKey,
+        })
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    step,
+    resolvedGeminiKey,
+    geminiBaseUrl,
+    geminiModel,
+    geminiDiscoveryKey,
+    geminiModelDiscovery.requestKey,
+    geminiModelDiscovery.status,
   ])
 
   function goToProviderConfig(selected: ConfigurableProvider): void {
@@ -164,16 +371,18 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
         return 'openaiApiKey'
       case 'openaiModel':
         return 'openaiBaseUrl'
+      case 'openaiModelManual':
+        return 'openaiModel'
       case 'openaiMode':
         return 'openaiModel'
       case 'geminiApiKey':
         return 'provider'
-      case 'geminiMode':
-        return 'geminiApiKey'
       case 'geminiBaseUrl':
-        return 'geminiMode'
+        return 'geminiApiKey'
       case 'geminiModel':
         return 'geminiBaseUrl'
+      case 'geminiModelManual':
+        return 'geminiModel'
       case 'anthropicBaseUrl':
         return 'provider'
       case 'anthropicModel':
@@ -214,7 +423,6 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
               apiKey: geminiApiKey || undefined,
               baseUrl: geminiBaseUrl || undefined,
               model: geminiModel || undefined,
-              vertexai: geminiMode === 'vertex',
             })
           : persistProviderConfig({
               provider,
@@ -225,6 +433,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       setError(result.error.message)
       return
     }
+    resetRuntimeProviderFlags()
     applyConfigEnvironmentVariables()
     setError(null)
     setIsValidating(true)
@@ -334,11 +543,139 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
   }
 
   if (step === 'openaiModel') {
+    if (
+      openaiModelDiscovery.status === 'loaded' &&
+      openaiModelDiscovery.models.length > 0
+    ) {
+      return (
+        <Box flexDirection="column" gap={1} paddingLeft={1}>
+          <Text bold>Choose a default OpenAI-compatible model</Text>
+          <Text dimColor width={72}>
+            The model list was loaded from your configured provider. Pick one or
+            enter a custom model manually.
+          </Text>
+          <Select
+            layout="compact-vertical"
+            visibleOptionCount={8}
+            defaultValue={openaiModel}
+            defaultFocusValue={
+              openaiModelDiscovery.models.some(model => model.id === openaiModel)
+                ? openaiModel
+                : openaiModelDiscovery.models[0]?.id
+            }
+            options={[
+              ...openaiModelDiscovery.models.map(model => ({
+                label: model.label,
+                value: model.id,
+                description: model.description,
+              })),
+              {
+                label: 'Enter model manually',
+                value: MODEL_DISCOVERY_MANUAL_VALUE,
+                description: 'Type a custom model ID not shown in the fetched list',
+              },
+            ]}
+            onChange={value => {
+              if (value === MODEL_DISCOVERY_MANUAL_VALUE) {
+                setStep('openaiModelManual')
+                return
+              }
+              setOpenaiModel(String(value))
+              setStep('openaiMode')
+            }}
+            onCancel={handleCancelOrBack}
+          />
+        </Box>
+      )
+    }
+
+    if (suggestedOpenAIModels.length > 0) {
+      return (
+        <Box flexDirection="column" gap={1} paddingLeft={1}>
+          <Text bold>Choose a default OpenAI-compatible model</Text>
+          <Text dimColor width={72}>
+            {openaiModelDiscovery.status === 'loading'
+              ? 'Checking the provider for available models in the background. You can already pick from the suggested list below or enter a model manually.'
+              : 'Automatic model discovery was not available on this endpoint, so a suggested list is shown instead. You can still enter any model manually.'}
+          </Text>
+          {openaiModelDiscovery.status === 'loading' ? (
+            <Text dimColor width={72}>Loading model list...</Text>
+          ) : null}
+          {openaiModelDiscovery.error ? (
+            <Text color="yellow" width={72}>
+              Could not load the model list automatically: {openaiModelDiscovery.error}
+            </Text>
+          ) : null}
+          <Select
+            layout="compact-vertical"
+            visibleOptionCount={8}
+            defaultValue={openaiModel}
+            defaultFocusValue={
+              suggestedOpenAIModels.some(model => model.id === openaiModel)
+                ? openaiModel
+                : suggestedOpenAIModels[0]?.id
+            }
+            options={[
+              ...suggestedOpenAIModels.map(model => ({
+                label: model.label,
+                value: model.id,
+                description: model.description,
+              })),
+              {
+                label: 'Enter model manually',
+                value: MODEL_DISCOVERY_MANUAL_VALUE,
+                description: 'Type a custom model ID not shown in the suggested list',
+              },
+            ]}
+            onChange={value => {
+              if (value === MODEL_DISCOVERY_MANUAL_VALUE) {
+                setStep('openaiModelManual')
+                return
+              }
+              setOpenaiModel(String(value))
+              setStep('openaiMode')
+            }}
+            onCancel={handleCancelOrBack}
+          />
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Default OpenAI-compatible model</Text>
         <Text dimColor width={72}>
           This becomes the default model for the main REPL loop.
+        </Text>
+        {openaiModelDiscovery.error ? (
+          <Text color="yellow" width={72}>
+            Could not load the model list automatically: {openaiModelDiscovery.error}
+          </Text>
+        ) : null}
+        <Box borderStyle="round" paddingLeft={1}>
+          <TextInput
+            value={openaiModel}
+            onChange={setOpenaiModel}
+            onSubmit={() => setStep('openaiMode')}
+            placeholder="gpt-5.4"
+            focus
+            showCursor
+            columns={72}
+            cursorOffset={cursorOffset}
+            onChangeCursorOffset={setCursorOffset}
+            onExit={handleCancelOrBack}
+          />
+        </Box>
+      </Box>
+    )
+  }
+
+  if (step === 'openaiModelManual') {
+    return (
+      <Box flexDirection="column" gap={1} paddingLeft={1}>
+        <Text bold>Enter a custom OpenAI-compatible model</Text>
+        <Text dimColor width={72}>
+          Type any model ID supported by your provider.
         </Text>
         <Box borderStyle="round" paddingLeft={1}>
           <TextInput
@@ -394,8 +731,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Gemini API key</Text>
         <Text dimColor width={72}>
-          Enter your Gemini API key. This also works for Vertex AI Express mode
-          and compatible Gemini gateways.
+          Enter your Gemini API key.
           {existingGeminiKey
             ? ' Press Enter on an empty input to keep the existing key.'
             : ''}
@@ -404,7 +740,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
           <TextInput
             value={geminiApiKey}
             onChange={setGeminiApiKey}
-            onSubmit={() => setStep('geminiMode')}
+            onSubmit={() => setStep('geminiBaseUrl')}
             placeholder={existingGeminiKey ? 'Keep existing key' : 'AIza...'}
             mask="*"
             focus
@@ -419,56 +755,20 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     )
   }
 
-  if (step === 'geminiMode') {
-    return (
-      <Box flexDirection="column" gap={1} paddingLeft={1}>
-        <Text bold>Gemini backend mode</Text>
-        <Text dimColor width={72}>
-          Use Gemini Developer API for Google AI Studio style endpoints, or
-          Vertex AI / Express mode for proxies and gateways that expect Vertex
-          routing semantics.
-        </Text>
-        <Select
-          options={[
-            {
-              label: 'Gemini Developer API',
-              value: 'developer',
-            },
-            {
-              label: 'Vertex AI / Express mode',
-              value: 'vertex',
-            },
-          ]}
-          defaultValue={geminiMode}
-          defaultFocusValue={geminiMode}
-          onChange={value => {
-            setGeminiMode(value as GeminiTransportMode)
-            setStep('geminiBaseUrl')
-          }}
-          onCancel={handleCancelOrBack}
-        />
-      </Box>
-    )
-  }
-
   if (step === 'geminiBaseUrl') {
     return (
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Gemini base URL</Text>
         <Text dimColor width={72}>
-          Optional. Leave empty for the default Google endpoint, or set a custom
-          Gemini-compatible gateway base URL.
+          Optional. Leave empty for the default Google Gemini endpoint, or set a
+          custom Gemini-compatible gateway base URL.
         </Text>
         <Box borderStyle="round" paddingLeft={1}>
           <TextInput
             value={geminiBaseUrl}
             onChange={setGeminiBaseUrl}
             onSubmit={() => setStep('geminiModel')}
-            placeholder={
-              geminiMode === 'vertex'
-                ? 'https://aiplatform.googleapis.com'
-                : 'https://generativelanguage.googleapis.com'
-            }
+            placeholder="https://generativelanguage.googleapis.com"
             focus
             showCursor
             columns={72}
@@ -482,11 +782,139 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
   }
 
   if (step === 'geminiModel') {
+    if (
+      geminiModelDiscovery.status === 'loaded' &&
+      geminiModelDiscovery.models.length > 0
+    ) {
+      return (
+        <Box flexDirection="column" gap={1} paddingLeft={1}>
+          <Text bold>Choose a default Gemini model</Text>
+          <Text dimColor width={72}>
+            The model list was loaded from your configured provider. Pick one or
+            enter a custom model manually.
+          </Text>
+          <Select
+            layout="compact-vertical"
+            visibleOptionCount={8}
+            defaultValue={geminiModel}
+            defaultFocusValue={
+              geminiModelDiscovery.models.some(model => model.id === geminiModel)
+                ? geminiModel
+                : geminiModelDiscovery.models[0]?.id
+            }
+            options={[
+              ...geminiModelDiscovery.models.map(model => ({
+                label: model.label,
+                value: model.id,
+                description: model.description,
+              })),
+              {
+                label: 'Enter model manually',
+                value: MODEL_DISCOVERY_MANUAL_VALUE,
+                description: 'Type a custom model ID not shown in the fetched list',
+              },
+            ]}
+            onChange={value => {
+              if (value === MODEL_DISCOVERY_MANUAL_VALUE) {
+                setStep('geminiModelManual')
+                return
+              }
+              setGeminiModel(String(value))
+              setStep('confirm')
+            }}
+            onCancel={handleCancelOrBack}
+          />
+        </Box>
+      )
+    }
+
+    if (suggestedGeminiModels.length > 0) {
+      return (
+        <Box flexDirection="column" gap={1} paddingLeft={1}>
+          <Text bold>Choose a default Gemini model</Text>
+          <Text dimColor width={72}>
+            {geminiModelDiscovery.status === 'loading'
+              ? 'Checking the provider for available Gemini models in the background. You can already pick from the suggested list below or enter a model manually.'
+              : 'Gemini model discovery was not available on this endpoint, so a suggested list is shown instead. You can still enter any model manually.'}
+          </Text>
+          {geminiModelDiscovery.status === 'loading' ? (
+            <Text dimColor width={72}>Loading model list...</Text>
+          ) : null}
+          {geminiModelDiscovery.error ? (
+            <Text color="yellow" width={72}>
+              Could not load the model list automatically: {geminiModelDiscovery.error}
+            </Text>
+          ) : null}
+          <Select
+            layout="compact-vertical"
+            visibleOptionCount={8}
+            defaultValue={geminiModel}
+            defaultFocusValue={
+              suggestedGeminiModels.some(model => model.id === geminiModel)
+                ? geminiModel
+                : suggestedGeminiModels[0]?.id
+            }
+            options={[
+              ...suggestedGeminiModels.map(model => ({
+                label: model.label,
+                value: model.id,
+                description: model.description,
+              })),
+              {
+                label: 'Enter model manually',
+                value: MODEL_DISCOVERY_MANUAL_VALUE,
+                description: 'Type a custom model ID not shown in the suggested list',
+              },
+            ]}
+            onChange={value => {
+              if (value === MODEL_DISCOVERY_MANUAL_VALUE) {
+                setStep('geminiModelManual')
+                return
+              }
+              setGeminiModel(String(value))
+              setStep('confirm')
+            }}
+            onCancel={handleCancelOrBack}
+          />
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Default Gemini model</Text>
         <Text dimColor width={72}>
           Gemini requests will use this as the default model.
+        </Text>
+        {geminiModelDiscovery.error ? (
+          <Text color="yellow" width={72}>
+            Could not load the model list automatically: {geminiModelDiscovery.error}
+          </Text>
+        ) : null}
+        <Box borderStyle="round" paddingLeft={1}>
+          <TextInput
+            value={geminiModel}
+            onChange={setGeminiModel}
+            onSubmit={() => setStep('confirm')}
+            placeholder="gemini-2.5-flash"
+            focus
+            showCursor
+            columns={72}
+            cursorOffset={cursorOffset}
+            onChangeCursorOffset={setCursorOffset}
+            onExit={handleCancelOrBack}
+          />
+        </Box>
+      </Box>
+    )
+  }
+
+  if (step === 'geminiModelManual') {
+    return (
+      <Box flexDirection="column" gap={1} paddingLeft={1}>
+        <Text bold>Enter a custom Gemini model</Text>
+        <Text dimColor width={72}>
+          Type any model ID supported by your provider.
         </Text>
         <Box borderStyle="round" paddingLeft={1}>
           <TextInput
@@ -571,8 +999,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       )}
       {provider === 'gemini' && (
         <Text dimColor width={72}>
-          Model: {geminiModel} | Mode:{' '}
-          {geminiMode === 'vertex' ? 'Vertex AI / Express' : 'Gemini Developer API'}
+          Model: {geminiModel}
           {geminiBaseUrl ? ` | Base URL: ${geminiBaseUrl}` : ''}
         </Text>
       )}

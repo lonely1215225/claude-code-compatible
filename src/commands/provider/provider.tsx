@@ -8,6 +8,7 @@ import {
   PROVIDER_OPTIONS,
   type ConfigurableProvider,
 } from '../../utils/providerConfig.js'
+import { getDefaultMainLoopModel } from '../../utils/model/model.js'
 import { getCurrentProviderLabel } from '../../utils/model/providers.js'
 import { refreshModelStringsForCurrentProvider } from '../../utils/model/modelStrings.js'
 
@@ -24,10 +25,11 @@ function ProviderCommand(t0: Props) {
   if ($[0] !== onDone || $[1] !== setAppState) {
     t1 = (provider: ConfigurableProvider) => {
       refreshModelStringsForCurrentProvider()
+      const nextDefaultModel = getDefaultMainLoopModel()
       setAppState(prev => ({
         ...prev,
         mainLoopModel: null,
-        mainLoopModelForSession: null,
+        mainLoopModelForSession: nextDefaultModel,
       }))
       const selectedLabel =
         PROVIDER_OPTIONS.find(option => option.value === provider)?.label ?? provider

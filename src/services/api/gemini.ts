@@ -19,7 +19,8 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import type { SystemPrompt } from '../../utils/systemPromptType.js'
 import type { ThinkingConfig } from '../../utils/thinking.js'
 import type { Options } from './claude.js'
-import { getGeminiClient } from './geminiClient.js'
+import { getGeminiApiKey, getGeminiBaseUrl } from './geminiClient.js'
+import { generateGeminiContentViaPython } from './geminiRest.js'
 
 type GeminiContent = {
   role: 'user' | 'model'
@@ -262,15 +263,102 @@ function geminiResponseText(response: Record<string, unknown>): string {
   return ''
 }
 
+function extractGeminiFunctionCalls(
+  response: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  if (Array.isArray(response.functionCalls)) {
+    return response.functionCalls as Array<Record<string, unknown>>
+  }
+
+  const calls: Array<Record<string, unknown>> = []
+  if (!Array.isArray(response.candidates)) {
+    return calls
+  }
+
+  for (const candidate of response.candidates as Array<Record<string, unknown>>) {
+    const content =
+      candidate.content && typeof candidate.content === 'object'
+        ? (candidate.content as Record<string, unknown>)
+        : null
+    const parts = content && Array.isArray(content.parts) ? content.parts : []
+    for (const part of parts) {
+      if (
+        part &&
+        typeof part === 'object' &&
+        'functionCall' in part &&
+        part.functionCall &&
+        typeof part.functionCall === 'object'
+      ) {
+        calls.push(part.functionCall as Record<string, unknown>)
+      }
+    }
+  }
+
+  return calls
+}
+
+async function generateGeminiResponse({
+  model,
+  contents,
+  systemPrompt,
+  geminiTools,
+  options,
+}: {
+  model: string
+  contents: GeminiContent[]
+  systemPrompt: SystemPrompt
+  geminiTools: Array<Record<string, unknown>>
+  options: Options
+}): Promise<Record<string, unknown>> {
+  const apiKey = getGeminiApiKey()
+  if (!apiKey) {
+    throw new Error(
+      'GEMINI_API_KEY or GOOGLE_API_KEY is required when CLAUDE_CODE_USE_GEMINI=1',
+    )
+  }
+
+  const body: Record<string, unknown> = {
+    contents,
+  }
+  if (systemPrompt.length > 0) {
+    body.systemInstruction = {
+      parts: [{ text: systemPrompt.join('\n\n') }],
+    }
+  }
+  if (geminiTools.length > 0) {
+    body.tools = geminiTools
+  }
+  const toolConfig = mapGeminiToolConfig(options.toolChoice)
+  if (toolConfig) {
+    body.toolConfig = toolConfig
+  }
+
+  const generationConfig: Record<string, unknown> = {}
+  if (options.maxOutputTokensOverride) {
+    generationConfig.maxOutputTokens = options.maxOutputTokensOverride
+  }
+  if (options.temperatureOverride !== undefined) {
+    generationConfig.temperature = options.temperatureOverride
+  }
+  if (Object.keys(generationConfig).length > 0) {
+    body.generationConfig = generationConfig
+  }
+
+  return generateGeminiContentViaPython({
+    apiKey,
+    baseUrl: getGeminiBaseUrl(),
+    model,
+    body,
+  })
+}
+
 function geminiResponseToAssistantMessage(
   response: Record<string, unknown>,
   model: string,
 ): AssistantMessage {
   const content: Array<Record<string, unknown>> = []
 
-  const functionCalls = Array.isArray(response.functionCalls)
-    ? (response.functionCalls as Array<Record<string, unknown>>)
-    : []
+  const functionCalls = extractGeminiFunctionCalls(response)
   for (const functionCall of functionCalls) {
     content.push({
       type: 'tool_use',
@@ -343,29 +431,19 @@ export async function* queryGeminiModelWithStreaming({
   void
 > {
   try {
-    const client = getGeminiClient()
     const model = normalizeModelStringForAPI(options.model)
     const contents = buildGeminiContents(messages, tools)
     const geminiTools = await buildGeminiTools(tools, options)
-    const response = (await client.models.generateContent({
+    if (signal.aborted) {
+      throw new Error('Gemini request aborted')
+    }
+    const response = await generateGeminiResponse({
       model,
       contents,
-      config: {
-        systemInstruction: systemPrompt.join('\n\n'),
-        ...(geminiTools.length > 0 ? { tools: geminiTools } : {}),
-        ...(mapGeminiToolConfig(options.toolChoice)
-          ? { toolConfig: mapGeminiToolConfig(options.toolChoice) }
-          : {}),
-        ...(options.maxOutputTokensOverride
-          ? { maxOutputTokens: options.maxOutputTokensOverride }
-          : {}),
-        ...(options.temperatureOverride !== undefined
-          ? { temperature: options.temperatureOverride }
-          : {}),
-      },
-    }, {
-      signal,
-    } as never)) as unknown as Record<string, unknown>
+      systemPrompt,
+      geminiTools,
+      options,
+    })
 
     yield {
       type: 'stream_event',

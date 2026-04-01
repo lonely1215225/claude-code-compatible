@@ -27,6 +27,16 @@ type OpenAIInputItem = Record<string, unknown>
 type OpenAIOutputItem = Record<string, unknown>
 type OpenAIChatMessage = Record<string, unknown>
 
+function shouldFallbackResponsesToChatCompletions(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase()
+  return (
+    message.includes("invalid value: 'input_text'") ||
+    (message.includes('input_text') &&
+      message.includes('supported values are') &&
+      message.includes('output_text'))
+  )
+}
+
 function toOpenAITextInput(text: string): OpenAIInputItem {
   return {
     type: 'input_text',
@@ -654,10 +664,10 @@ export async function* queryOpenAIModelWithStreaming({
       fetchOverride: options.fetchOverride,
     })
     const model = normalizeModelStringForAPI(options.model)
-    if (getOpenAIAPIMode() === 'chat_completions') {
-      const chatMessages = buildOpenAIChatMessages(messages, tools, systemPrompt)
-      const chatTools = await buildOpenAIChatTools(tools, options)
-      const response = (await client.chat.completions.create(
+    const chatMessages = buildOpenAIChatMessages(messages, tools, systemPrompt)
+    const chatTools = await buildOpenAIChatTools(tools, options)
+    const createChatCompletion = async () =>
+      ((await client.chat.completions.create(
         {
           model,
           messages: chatMessages as never,
@@ -678,7 +688,9 @@ export async function* queryOpenAIModelWithStreaming({
         {
           signal,
         },
-      )) as unknown as Record<string, unknown>
+      )) as unknown as Record<string, unknown>)
+    if (getOpenAIAPIMode() === 'chat_completions') {
+      const response = await createChatCompletion()
 
       yield {
         type: 'stream_event',
@@ -693,30 +705,51 @@ export async function* queryOpenAIModelWithStreaming({
     }
     const input = buildOpenAIInput(messages, tools)
     const openAITools = await buildOpenAITools(tools, options)
-    const response = (await client.responses.create({
-      model,
-      instructions: systemPrompt.join('\n\n'),
-      input,
-      ...(openAITools.length > 0 ? { tools: openAITools } : {}),
-      ...(mapToolChoice(options.toolChoice)
-        ? { tool_choice: mapToolChoice(options.toolChoice) }
-        : {}),
-      ...(options.maxOutputTokensOverride
-        ? { max_output_tokens: options.maxOutputTokensOverride }
-        : {}),
-      ...(options.temperatureOverride !== undefined
-        ? { temperature: options.temperatureOverride }
-        : {}),
-      ...(mapStructuredOutput(options.outputFormat)
-        ? { text: mapStructuredOutput(options.outputFormat) }
-        : {}),
-      ...(mapReasoningConfig(thinkingConfig, options)
-        ? { reasoning: mapReasoningConfig(thinkingConfig, options) }
-        : {}),
-      parallel_tool_calls: true,
-    }, {
-      signal,
-    })) as unknown as Record<string, unknown>
+    let response: Record<string, unknown>
+    try {
+      response = (await client.responses.create({
+        model,
+        instructions: systemPrompt.join('\n\n'),
+        input,
+        ...(openAITools.length > 0 ? { tools: openAITools } : {}),
+        ...(mapToolChoice(options.toolChoice)
+          ? { tool_choice: mapToolChoice(options.toolChoice) }
+          : {}),
+        ...(options.maxOutputTokensOverride
+          ? { max_output_tokens: options.maxOutputTokensOverride }
+          : {}),
+        ...(options.temperatureOverride !== undefined
+          ? { temperature: options.temperatureOverride }
+          : {}),
+        ...(mapStructuredOutput(options.outputFormat)
+          ? { text: mapStructuredOutput(options.outputFormat) }
+          : {}),
+        ...(mapReasoningConfig(thinkingConfig, options)
+          ? { reasoning: mapReasoningConfig(thinkingConfig, options) }
+          : {}),
+        parallel_tool_calls: true,
+      }, {
+        signal,
+      })) as unknown as Record<string, unknown>
+    } catch (error) {
+      if (!shouldFallbackResponsesToChatCompletions(error)) {
+        throw error
+      }
+      logForDebugging(
+        `[OpenAI] Responses API unsupported by current endpoint, retrying with chat.completions: ${errorMessage(error)}`,
+        { level: 'warning' },
+      )
+      const chatResponse = await createChatCompletion()
+      yield {
+        type: 'stream_event',
+        event: {
+          type: 'response.completed',
+          response_id: chatResponse.id,
+        },
+      }
+      yield chatCompletionToAssistantMessage(chatResponse, model)
+      return
+    }
 
     yield {
       type: 'stream_event',

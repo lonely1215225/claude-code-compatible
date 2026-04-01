@@ -1,11 +1,11 @@
 # Claude Code Compatible
 
 <p align="center">
-  <img src="./compatible.png" alt="Claude Code Compatible terminal screenshot" width="980" />
+  <img src="./assets/images/compatible.png" alt="Claude Code Compatible terminal screenshot" width="980" />
 </p>
 
 <p align="center">
-  <img src="./provider.png" alt="Provider setup screen showing compatible providers" width="900" />
+  <img src="./assets/images/switchmodel.png" alt="Provider switching screen showing Gemini and OpenAI model changes" width="900" />
 </p>
 
 This project further refines the Claude Code compatibility path for Bun.
