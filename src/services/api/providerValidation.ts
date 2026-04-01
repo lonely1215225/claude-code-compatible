@@ -10,6 +10,7 @@ import {
 } from './openaiClient.js'
 
 const OPENAI_VALIDATION_OUTPUT_TOKENS = 16
+const DEFAULT_PROVIDER_VALIDATION_TIMEOUT_MS = getDefaultProviderValidationTimeoutMs()
 
 export type ProviderValidationResult = {
   provider: ReturnType<typeof getAPIProvider>
@@ -35,8 +36,14 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   })
 }
 
+function getDefaultProviderValidationTimeoutMs(): number {
+  const raw = process.env.CLAUDE_CODE_PROVIDER_VALIDATION_TIMEOUT_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20000
+}
+
 export async function validateConfiguredProvider({
-  timeoutMs = 10000,
+  timeoutMs = DEFAULT_PROVIDER_VALIDATION_TIMEOUT_MS,
 }: {
   timeoutMs?: number
 } = {}): Promise<ProviderValidationResult> {

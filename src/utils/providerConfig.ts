@@ -15,6 +15,7 @@ export type ProviderConfigValues = {
   baseUrl?: string
   model?: string
   apiMode?: 'responses' | 'chat_completions'
+  vertexai?: boolean
 }
 
 export const PROVIDER_OPTIONS: Array<{
@@ -109,6 +110,9 @@ export function persistProviderConfig(values: ProviderConfigValues): {
       values.apiKey || currentEnv.GEMINI_API_KEY || currentEnv.GOOGLE_API_KEY
     nextEnv.GOOGLE_API_KEY =
       values.apiKey || currentEnv.GOOGLE_API_KEY || currentEnv.GEMINI_API_KEY
+    nextEnv.GEMINI_BASE_URL = values.baseUrl || undefined
+    nextEnv.GOOGLE_GENAI_USE_VERTEXAI = values.vertexai ? 'true' : undefined
+    nextEnv.GEMINI_USE_VERTEXAI = undefined
     nextEnv.GEMINI_MODEL = values.model || getProviderDefaultModel('gemini')
   } else {
     if (values.baseUrl !== undefined) {

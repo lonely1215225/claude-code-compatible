@@ -15,6 +15,7 @@ import {
   getCurrentProviderLabel,
   isProviderInteractive,
 } from '../utils/model/providers.js'
+import { isEnvTruthy } from '../utils/envUtils.js'
 import { validateConfiguredProvider } from '../services/api/providerValidation.js'
 import TextInput from './TextInput.js'
 import { Select } from './CustomSelect/select.js'
@@ -31,10 +32,14 @@ type WizardStep =
   | 'openaiModel'
   | 'openaiMode'
   | 'geminiApiKey'
+  | 'geminiMode'
+  | 'geminiBaseUrl'
   | 'geminiModel'
   | 'anthropicBaseUrl'
   | 'anthropicModel'
   | 'confirm'
+
+type GeminiTransportMode = 'developer' | 'vertex'
 
 export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode {
   const initialProvider = useMemo(() => getConfiguredProviderForSetup(), [])
@@ -59,6 +64,10 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       getSavedProviderEnvValue('GOOGLE_API_KEY'),
     [],
   )
+  const existingGeminiBaseUrl = useMemo(
+    () => getSavedProviderEnvValue('GEMINI_BASE_URL') || '',
+    [],
+  )
   const [openaiApiKey, setOpenaiApiKey] = useState('')
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState(
     () => getSavedProviderEnvValue('OPENAI_BASE_URL') || '',
@@ -71,6 +80,12 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     () => getProviderDefaultApiMode('openai'),
   )
   const [geminiApiKey, setGeminiApiKey] = useState('')
+  const [geminiMode, setGeminiMode] = useState<GeminiTransportMode>(() =>
+    isEnvTruthy(getSavedProviderEnvValue('GOOGLE_GENAI_USE_VERTEXAI'))
+      ? 'vertex'
+      : 'developer',
+  )
+  const [geminiBaseUrl, setGeminiBaseUrl] = useState(existingGeminiBaseUrl)
   const [geminiModel, setGeminiModel] = useState(() =>
     getSavedProviderEnvValue('GEMINI_MODEL') ||
     getProviderDefaultModel('gemini'),
@@ -97,6 +112,9 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       case 'geminiApiKey':
         setCursorOffset(geminiApiKey.length)
         break
+      case 'geminiBaseUrl':
+        setCursorOffset(geminiBaseUrl.length)
+        break
       case 'geminiModel':
         setCursorOffset(geminiModel.length)
         break
@@ -116,6 +134,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     openaiBaseUrl,
     openaiModel,
     geminiApiKey,
+    geminiBaseUrl,
     geminiModel,
     anthropicBaseUrl,
     anthropicModel,
@@ -149,8 +168,12 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
         return 'openaiModel'
       case 'geminiApiKey':
         return 'provider'
-      case 'geminiModel':
+      case 'geminiMode':
         return 'geminiApiKey'
+      case 'geminiBaseUrl':
+        return 'geminiMode'
+      case 'geminiModel':
+        return 'geminiBaseUrl'
       case 'anthropicBaseUrl':
         return 'provider'
       case 'anthropicModel':
@@ -189,7 +212,9 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
           ? persistProviderConfig({
               provider,
               apiKey: geminiApiKey || undefined,
+              baseUrl: geminiBaseUrl || undefined,
               model: geminiModel || undefined,
+              vertexai: geminiMode === 'vertex',
             })
           : persistProviderConfig({
               provider,
@@ -204,9 +229,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
     setError(null)
     setIsValidating(true)
     try {
-      await validateConfiguredProvider({
-        timeoutMs: 10000,
-      })
+      await validateConfiguredProvider()
     } catch (validationError) {
       setError(
         validationError instanceof Error
@@ -371,7 +394,8 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Gemini API key</Text>
         <Text dimColor width={72}>
-          Enter your Gemini Developer API key.
+          Enter your Gemini API key. This also works for Vertex AI Express mode
+          and compatible Gemini gateways.
           {existingGeminiKey
             ? ' Press Enter on an empty input to keep the existing key.'
             : ''}
@@ -380,9 +404,71 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
           <TextInput
             value={geminiApiKey}
             onChange={setGeminiApiKey}
-            onSubmit={() => setStep('geminiModel')}
+            onSubmit={() => setStep('geminiMode')}
             placeholder={existingGeminiKey ? 'Keep existing key' : 'AIza...'}
             mask="*"
+            focus
+            showCursor
+            columns={72}
+            cursorOffset={cursorOffset}
+            onChangeCursorOffset={setCursorOffset}
+            onExit={handleCancelOrBack}
+          />
+        </Box>
+      </Box>
+    )
+  }
+
+  if (step === 'geminiMode') {
+    return (
+      <Box flexDirection="column" gap={1} paddingLeft={1}>
+        <Text bold>Gemini backend mode</Text>
+        <Text dimColor width={72}>
+          Use Gemini Developer API for Google AI Studio style endpoints, or
+          Vertex AI / Express mode for proxies and gateways that expect Vertex
+          routing semantics.
+        </Text>
+        <Select
+          options={[
+            {
+              label: 'Gemini Developer API',
+              value: 'developer',
+            },
+            {
+              label: 'Vertex AI / Express mode',
+              value: 'vertex',
+            },
+          ]}
+          defaultValue={geminiMode}
+          defaultFocusValue={geminiMode}
+          onChange={value => {
+            setGeminiMode(value as GeminiTransportMode)
+            setStep('geminiBaseUrl')
+          }}
+          onCancel={handleCancelOrBack}
+        />
+      </Box>
+    )
+  }
+
+  if (step === 'geminiBaseUrl') {
+    return (
+      <Box flexDirection="column" gap={1} paddingLeft={1}>
+        <Text bold>Gemini base URL</Text>
+        <Text dimColor width={72}>
+          Optional. Leave empty for the default Google endpoint, or set a custom
+          Gemini-compatible gateway base URL.
+        </Text>
+        <Box borderStyle="round" paddingLeft={1}>
+          <TextInput
+            value={geminiBaseUrl}
+            onChange={setGeminiBaseUrl}
+            onSubmit={() => setStep('geminiModel')}
+            placeholder={
+              geminiMode === 'vertex'
+                ? 'https://aiplatform.googleapis.com'
+                : 'https://generativelanguage.googleapis.com'
+            }
             focus
             showCursor
             columns={72}
@@ -400,7 +486,7 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
       <Box flexDirection="column" gap={1} paddingLeft={1}>
         <Text bold>Default Gemini model</Text>
         <Text dimColor width={72}>
-          Gemini official requests will use this as the default model.
+          Gemini requests will use this as the default model.
         </Text>
         <Box borderStyle="round" paddingLeft={1}>
           <TextInput
@@ -484,7 +570,11 @@ export function ProviderSetupStep({ onDone, onCancel }: Props): React.ReactNode 
         </Text>
       )}
       {provider === 'gemini' && (
-        <Text dimColor width={72}>Model: {geminiModel}</Text>
+        <Text dimColor width={72}>
+          Model: {geminiModel} | Mode:{' '}
+          {geminiMode === 'vertex' ? 'Vertex AI / Express' : 'Gemini Developer API'}
+          {geminiBaseUrl ? ` | Base URL: ${geminiBaseUrl}` : ''}
+        </Text>
       )}
       {provider === 'anthropic' && (
         <Text dimColor width={72}>Model: {anthropicModel || 'sonnet'}</Text>
