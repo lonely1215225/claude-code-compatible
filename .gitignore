@@ -1,0 +1,11 @@
+node_modules
+.claude
+.DS_Store
+dist
+coverage
+.env
+*.log
+.idea
+.vscode
+*.suo
+*.lock
